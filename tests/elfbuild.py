@@ -16,7 +16,9 @@ EM_X86_64 = 62
 R_X86_64_64 = 1
 R_X86_64_PC32 = 2
 
+STB_LOCAL = 0
 STB_GLOBAL = 1
+STB_WEAK = 2
 STT_NOTYPE = 0
 STT_SECTION = 3
 
@@ -39,7 +41,7 @@ def _strtab(strings: list[bytes]) -> tuple[bytes, dict[int, int]]:
 def build_elf(
     *,
     text: bytes = b"\x90" * 32,
-    symbols: list[tuple[str, str | int, int]] | None = None,
+    symbols: list[tuple] | None = None,
     relocs: list[dict] | None = None,
     text_duplicate: bool = False,
     rodata: bytes | None = None,
@@ -55,11 +57,13 @@ def build_elf(
     ei_data: int = 1,
     e_phoff: int = 0,
     shstrndx_valid: bool = True,
+    text_addralign: int = 16,
 ) -> bytes:
     """构造一个最小化 ET_REL。
 
-    symbols 每项为 ``(名称, 所属节, st_value)``；所属节为 0 表示 SHN_UNDEF，
-    ``"text"`` / ``"rodata"`` 表示对应节索引。
+    symbols 每项为 ``(名称, 所属节, st_value)`` 或
+    ``(名称, 所属节, st_value, bind)``；所属节为 0 表示 SHN_UNDEF，
+    ``"text"`` / ``"rodata"`` 表示对应节索引，bind 默认为 STB_GLOBAL。
     relocs 每项为 ``{"offset","sym","type","addend"}``，sym 为 1 基符号序号
     （0 号为保留空符号）。
     """
@@ -70,7 +74,7 @@ def build_elf(
     logical: list[dict] = []
     logical.append({"name": "", "type": 0})
     text_idx = len(logical)
-    logical.append({"name": ".text", "type": SHT_PROGBITS, "data": text, "align": 16})
+    logical.append({"name": ".text", "type": SHT_PROGBITS, "data": text, "align": text_addralign})
     if text_duplicate:
         logical.append({"name": ".text", "type": SHT_PROGBITS, "data": b"\xc3", "align": 16})
     rodata_idx: int | None = None
@@ -98,22 +102,38 @@ def build_elf(
         return {"text": text_idx, "rodata": rodata_idx}[desc]  # type: ignore[index]
 
     # ---- 字符串表 / 符号表
+    # ELF 要求 STB_LOCAL 符号排在 sh_info 之前：局部符号按输入顺序前置，
+    # 全局/弱符号按输入顺序随后；reloc 里的 sym 序号（基于 symbols 输入
+    # 顺序，1 基）通过 sym_index_map 自动重映射，调用方无需感知。
     str_names = [s[0].encode("latin-1") for s in symbols]
     strtab_blob, str_offsets = _strtab(str_names)
     logical[strtab_idx]["data"] = strtab_blob
 
+    parsed_syms: list[tuple[str, int, int, int]] = []
+    for i, spec in enumerate(symbols):
+        name = spec[0]
+        sec_desc = spec[1]
+        value = spec[2]
+        bind = spec[3] if len(spec) > 3 else STB_GLOBAL
+        parsed_syms.append((name, resolve_shndx(sec_desc), value, bind))
+
+    local_specs = [(i, s) for i, s in enumerate(parsed_syms) if s[3] == STB_LOCAL]
+    global_specs = [(i, s) for i, s in enumerate(parsed_syms) if s[3] != STB_LOCAL]
+    ordered_specs = local_specs + global_specs
+    sym_index_map = {orig_i + 1: new_i + 1 for new_i, (orig_i, _s) in enumerate(ordered_specs)}
+
     sym_blob = b"\x00" * 24
-    for i, (_name, sec_desc, value) in enumerate(symbols):
-        info = (STB_GLOBAL << 4) | STT_NOTYPE
-        shndx = resolve_shndx(sec_desc)
-        sym_blob += struct.pack("<IBBHQQ", str_offsets[i], info, 0, shndx, value, 0)
+    for _orig_i, (name, shndx, value, bind) in ordered_specs:
+        info = (bind << 4) | STT_NOTYPE
+        sym_blob += struct.pack("<IBBHQQ", str_offsets[_orig_i], info, 0, shndx, value, 0)
     logical[symtab_idx]["data"] = sym_blob
 
-    # ---- RELA / REL
+    # ---- RELA / REL（sym 序号为输入顺序 1 基，按局部前置布局重映射）
     def encode_rela(relocs: list[dict]) -> bytes:
         blob = b""
         for r in relocs:
-            r_info = (r["sym"] << 32) | (r["type"] & 0xFFFFFFFF)
+            mapped = sym_index_map.get(r["sym"], r["sym"])
+            r_info = (mapped << 32) | (r["type"] & 0xFFFFFFFF)
             if rela_type == SHT_RELA:
                 blob += struct.pack("<QQq", r["offset"], r_info, r.get("addend", 0))
             else:
@@ -147,7 +167,7 @@ def build_elf(
     # ---- 链接字段
     target = text_idx if rela_info is None else (resolve_shndx(rela_info) if isinstance(rela_info, str) else rela_info)
     logical[symtab_idx]["link"] = strtab_idx
-    logical[symtab_idx]["info"] = 1  # 仅 null 符号（#0）为局部符号
+    logical[symtab_idx]["info"] = len(local_specs) + 1  # STB_LOCAL 全部前置
     logical[symtab_idx]["entsize"] = symtab_bad_entsize if symtab_bad_entsize is not None else 24
     logical[rela_idx]["link"] = symtab_idx
     logical[rela_idx]["info"] = target
@@ -198,7 +218,7 @@ def build_elf(
             sec["size"],
             sec.get("link", 0),
             sec.get("info", 0),
-            1,
+            sec.get("align", 1) if sec.get("align", 1) else 1,
             sec.get("entsize", 0),
         )
         out[shoff + i * 64 : shoff + (i + 1) * 64] = shdr

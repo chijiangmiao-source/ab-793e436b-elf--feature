@@ -4,10 +4,14 @@
 
 1. 单元测试（``python -m unittest`` 全量）；
 2. 构建检查（全部源码字节编译 + 关键模块导入）；
-3. HTTP 冒烟（健康检查 + 三个必测场景）：
+3. HTTP 冒烟（健康检查 + 单文件三场景 + 联合审计三场景）：
    a. 双类型重定位（R_X86_64_64 + R_X86_64_PC32）成功并逐项返回 S/A/P；
    b. 重叠写入被拒绝（patch_overlap）；
-   c. PC32 有符号 32 位溢出被拒绝（pc32_overflow），且无部分结果。
+   c. PC32 有符号 32 位溢出被拒绝（pc32_overflow），且无部分结果；
+   d. 联合审计跨成员成功解析（local/member/external 三类来源），成员按
+      标识排序对齐布局，冻结结论可凭标识读回；
+   e. 联合审计重复导出被整组拒绝（duplicate_export），旧联合成功结论清除；
+   f. 成员次序调换但标识与内容相同，布局与冻结摘要保持一致。
 
 任何一步失败立即以非零退出码结束；全部成功退出码为 0。
 """
@@ -30,7 +34,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
-from elfbuild import build_elf  # noqa: E402
+from elfbuild import STB_LOCAL, build_elf  # noqa: E402
 
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:8080")
 TIMEOUT = 5
@@ -46,7 +50,7 @@ def fail(msg: str) -> None:
 
 
 def check_unit_tests() -> None:
-    step("1/3 单元测试")
+    step("1/4 单元测试")
     proc = subprocess.run(
         [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"],
         cwd=ROOT,
@@ -57,7 +61,7 @@ def check_unit_tests() -> None:
 
 
 def check_build() -> None:
-    step("2/3 构建检查（字节编译 + 模块导入）")
+    step("2/4 构建检查（字节编译 + 模块导入）")
     for py in list((ROOT / "app").rglob("*.py")) + [Path(__file__)]:
         try:
             py_compile.compile(str(py), doraise=True)
@@ -160,8 +164,159 @@ def pc32_overflow_elf() -> bytes:
     )
 
 
+# --- 联合审计成员 -----------------------------------------------------------
+
+
+def joint_alpha_elf() -> bytes:
+    # alpha 导出 alpha_fn@.text+0x10；本地 alpha_local@.text+0x08 被本成员
+    # PC32 引用；偏移 0x10 的 R64 引用外部 ext_helper。
+    return build_elf(
+        text=bytes(range(32)),
+        symbols=[
+            ("alpha_fn", "text", 0x10),
+            ("alpha_local", "text", 0x08, STB_LOCAL),
+            ("ext_helper", 0, 0),
+        ],
+        relocs=[
+            {"offset": 0x00, "sym": 2, "type": 2, "addend": 0},
+            {"offset": 0x10, "sym": 3, "type": 1, "addend": 0x20},
+        ],
+        text_addralign=16,
+    )
+
+
+def joint_beta_elf() -> bytes:
+    # beta 以 SHN_UNDEF 引用 alpha 的全局 alpha_fn（PC32）
+    return build_elf(
+        text=b"\x00" * 32,
+        symbols=[("alpha_fn", 0, 0)],
+        relocs=[{"offset": 0x00, "sym": 1, "type": 2, "addend": -4}],
+        text_addralign=16,
+    )
+
+
+def joint_payload(members, audit_id="verify-joint", symbols=None):
+    return {
+        "audit_id": audit_id,
+        "load_base": 0x400000,
+        "symbols": {"ext_helper": 0x600000} if symbols is None else symbols,
+        "members": [
+            {"member_id": mid, "file_base64": b64(blob)} for mid, blob in members
+        ],
+    }
+
+
+def check_joint_smoke() -> None:
+    step("4/4 联合（多成员）审计 HTTP 冒烟")
+    # 场景 d：跨成员成功解析；故意把 beta 放在提交列表前面，验证稳定排序
+    payload = joint_payload(
+        [("beta", joint_beta_elf()), ("alpha", joint_alpha_elf())],
+        "verify-joint-ok",
+    )
+    status, body = http_post("/api/joint/audit", payload)
+    if status != 200 or not body.get("ok"):
+        fail(f"联合审计跨成员解析应成功：HTTP {status} {body}")
+    if body.get("member_count") != 2 or body.get("item_count") != 3:
+        fail(f"联合结果成员/重定位项数量异常：{body.get('member_count')}/{body.get('item_count')}")
+    members = body["members"]
+    if [m["member"] for m in members] != ["alpha", "beta"]:
+        fail(f"成员未按标识排序：{[m['member'] for m in members]}")
+    if members[0]["base"] != "0x0000000000400000" or members[1]["base"] != "0x0000000000400020":
+        fail(f"成员连续布局基址错误：{[(m['member'], m['base']) for m in members]}")
+    if members[0]["range"] != ["0x0000000000400000", "0x0000000000400020"]:
+        fail(f"成员代码范围错误：{members[0]['range']}")
+    items = body["items"]
+    keys = [(it["member"], it["offset"]) for it in items]
+    if keys != [("alpha", 0), ("alpha", 0x10), ("beta", 0)]:
+        fail(f"重定位项未按成员/节内偏移稳定排序：{keys}")
+    sources = {(it["member"], it["symbol"]): it["source"] for it in items}
+    if sources != {
+        ("alpha", "alpha_local"): "local",
+        ("alpha", "ext_helper"): "external",
+        ("beta", "alpha_fn"): "member",
+    }:
+        fail(f"重定位来源分类异常：{sources}")
+    cross = next(it for it in items if it["member"] == "beta")
+    if cross["source_member"] != "alpha" or cross["S"] != "0x0000000000400010":
+        fail(f"跨成员符号地址解析错误：{cross}")
+    if cross["after_hex"] != struct.pack("<i", 0x400010 - 4 - 0x400020).hex():
+        fail(f"跨成员 PC32 写入值错误：{cross['after_hex']}")
+    for it in items:
+        for key in ("S", "A", "P", "value", "before_hex", "after_hex"):
+            if key not in it:
+                fail(f"联合结果缺少字段 {key}")
+    if len(body.get("conclusion", "")) != 64:
+        fail("联合冻结结论 SHA-256 缺失")
+    print(f"verify: 联合审计跨成员解析成功，结论 {body['conclusion']}")
+
+    status, fetched = http_get("/api/joint/result/verify-joint-ok")
+    if status != 200 or not fetched.get("ok") or fetched.get("conclusion") != body["conclusion"]:
+        fail("联合冻结结论无法按标识读回或内容不一致")
+    print("verify: 联合冻结结论读回一致")
+
+    # 场景 f：成员次序调换（标识与内容相同）-> 同一布局与冻结摘要
+    swapped = joint_payload(
+        [("alpha", joint_alpha_elf()), ("beta", joint_beta_elf())],
+        "verify-joint-ok",
+    )
+    status, body2 = http_post("/api/joint/audit", swapped)
+    if status != 200 or not body2.get("ok"):
+        fail(f"调换次序后的联合审计应成功：HTTP {status} {body2}")
+    if body2["conclusion"] != body["conclusion"]:
+        fail("成员次序调换但标识与内容相同，冻结摘要应一致")
+    if [(m["member"], m["base"], m["range"]) for m in body2["members"]] != [
+        (m["member"], m["base"], m["range"]) for m in body["members"]
+    ]:
+        fail("成员次序调换后布局不一致")
+    print("verify: 成员次序无关性成立（布局与冻结摘要一致）")
+
+    # 场景 e：重复导出整组拒绝，且清除该标识下旧联合成功结论
+    dup_a = build_elf(text=b"\x90" * 8, symbols=[("dup", "text", 0)], relocs=[])
+    dup_g = build_elf(text=b"\x90" * 8, symbols=[("dup", "text", 4)], relocs=[])
+    dup_b = build_elf(
+        text=b"\x00" * 16,
+        symbols=[("dup", 0, 0)],
+        relocs=[{"offset": 0, "sym": 1, "type": 2, "addend": 0}],
+    )
+    payload_dup = joint_payload(
+        [("alpha", dup_a), ("beta", dup_b), ("gamma", dup_g)],
+        "verify-joint-ok",  # 故意复用：旧 PASS 必须被清除
+        symbols={},
+    )
+    status, body_dup = http_post("/api/joint/audit", payload_dup)
+    if status != 200 or body_dup.get("ok"):
+        fail(f"重复导出应被整组拒绝：HTTP {status} {body_dup}")
+    if body_dup["violation"]["code"] != "duplicate_export":
+        fail(f"违约代码应为 duplicate_export：{body_dup['violation']}")
+    if body_dup["violation"].get("member") != "beta":
+        fail(f"重复导出未定位到首个相关重定位所在成员：{body_dup['violation']}")
+    if "conclusion" in body_dup:
+        fail("拒绝响应中不得携带旧联合冻结结论")
+    status, again = http_get("/api/joint/result/verify-joint-ok")
+    if status != 200 or again.get("ok") or "conclusion" in again:
+        fail("旧联合成功结论未被清除")
+    print("verify: 重复导出已整组拒绝，首个相关重定位已定位，旧成功结论已清除")
+
+    # 单文件接口不受联合审计影响（旧单文件回归）
+    status, single = http_post(
+        "/api/audit",
+        {
+            "audit_id": "verify-single-regression",
+            "file_base64": b64(double_type_elf()),
+            "load_base": 0x400000,
+            "symbols": {"ext_foo": 0x500000, "memcpy": 0x400200},
+        },
+    )
+    if status != 200 or not single.get("ok") or single.get("joint"):
+        fail(f"单文件接口回归失败：HTTP {status} {single}")
+    status, single_get = http_get("/api/result/verify-single-regression")
+    if status != 200 or single_get.get("conclusion") != single["conclusion"]:
+        fail("单文件结果读回回归失败")
+    print("verify: 旧单文件审计接口与读取结果保持不变")
+
+
 def check_http_smoke() -> None:
-    step("3/3 HTTP 冒烟")
+    step("3/4 单文件 HTTP 冒烟")
     wait_for_health()
 
     # 页面可访问且包含审计台标记
@@ -256,6 +411,7 @@ def main() -> None:
     check_unit_tests()
     check_build()
     check_http_smoke()
+    check_joint_smoke()
     print("\n=== verify: ALL CHECKS PASSED ===", flush=True)
     sys.exit(0)
 

@@ -4,8 +4,10 @@
 
 * ``GET  /``               审计页面
 * ``GET  /healthz``        健康状态
-* ``POST /api/audit``      提交一次审计（JSON）
-* ``GET  /api/result/<id>`` 读取已冻结结论 / 首个违约定位
+* ``POST /api/audit``      提交一次单文件审计（JSON）
+* ``GET  /api/result/<id>`` 读取已冻结单文件结论 / 首个违约定位
+* ``POST /api/joint/audit``      提交一次多成员联合审计（2..8 个成员）
+* ``GET  /api/joint/result/<id>`` 读取已冻结联合结论 / 首个违约定位
 
 服务仅使用标准库；监听地址由环境变量 ``HOST`` / ``PORT`` 配置。
 """
@@ -25,6 +27,13 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 
 from .elfaudit import AuditResult, AuditViolation, audit, freeze_conclusion
+from .joinaudit import (
+    MAX_MEMBERS,
+    MAX_MEMBER_ID_LEN,
+    MIN_MEMBERS,
+    freeze_joint_conclusion,
+    joint_audit,
+)
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 _AUDIT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -34,6 +43,8 @@ _MAX_SYMBOLS = 4096
 _store_lock = threading.Lock()
 # audit_id -> {"kind": "pass"/"fail", ...}
 _store: dict[str, dict[str, Any]] = {}
+# 联合审计标识 -> {"kind": "joint_pass"/"joint_fail", ...}
+_joint_store: dict[str, dict[str, Any]] = {}
 
 
 def parse_uint(value: Any, field_name: str) -> int:
@@ -137,6 +148,113 @@ def _public_record(audit_id: str, record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# 联合（多成员）审计
+# ---------------------------------------------------------------------------
+
+_MEMBER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,126}$")
+
+
+def _normalize_joint_payload(
+    payload: Any,
+) -> tuple[str, int, list[tuple[str, bytes]], dict[str, int]]:
+    if not isinstance(payload, dict):
+        raise ValueError("请求体必须是 JSON 对象")
+
+    audit_id = payload.get("audit_id")
+    if not isinstance(audit_id, str) or not _AUDIT_ID_RE.match(audit_id):
+        raise ValueError("audit_id 必须为 1..128 字符，仅限字母数字及 . _ : -，且以字母数字开头")
+
+    if "load_base" not in payload:
+        raise ValueError("缺少 load_base（代码装载基址）")
+    load_base = parse_uint(payload["load_base"], "load_base")
+
+    raw_members = payload.get("members")
+    if not isinstance(raw_members, list):
+        raise ValueError("members 必须为 [{member_id, file_base64}, ...] 列表")
+    if not (MIN_MEMBERS <= len(raw_members) <= MAX_MEMBERS):
+        raise ValueError(f"联合审计要求 {MIN_MEMBERS}..{MAX_MEMBERS} 个具名成员")
+    members: list[tuple[str, bytes]] = []
+    seen: set[str] = set()
+    for row in raw_members:
+        if not isinstance(row, dict) or "member_id" not in row or "file_base64" not in row:
+            raise ValueError("members 每项必须包含 member_id 与 file_base64")
+        member_id = row["member_id"]
+        if not isinstance(member_id, str) or not _MEMBER_ID_RE.match(member_id):
+            raise ValueError(
+                f"member_id 必须为 1..{MAX_MEMBER_ID_LEN + 1} 字符，仅限字母数字及 . _ : -，"
+                "且以字母数字开头"
+            )
+        if member_id in seen:
+            raise ValueError(f"成员标识重复：{member_id}")
+        seen.add(member_id)
+        b64 = row["file_base64"]
+        if not isinstance(b64, str) or not b64:
+            raise ValueError(f"成员 {member_id} 的 file_base64 必须为非空 Base64 字符串")
+        try:
+            file_bytes = base64.b64decode(b64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError(f"成员 {member_id} Base64 解码失败：{exc}") from exc
+        if not file_bytes:
+            raise ValueError(f"成员 {member_id} 解码后的文件为空")
+        members.append((member_id, file_bytes))
+
+    raw_symbols = payload.get("symbols", {})
+    symbols: dict[str, int] = {}
+    if isinstance(raw_symbols, dict):
+        items: list[tuple[Any, Any]] = list(raw_symbols.items())
+    elif isinstance(raw_symbols, list):
+        items = []
+        for row in raw_symbols:
+            if not isinstance(row, dict) or "name" not in row or "address" not in row:
+                raise ValueError("symbols 列表每项必须包含 name 与 address")
+            items.append((row["name"], row["address"]))
+    else:
+        raise ValueError("symbols 必须为 {名称: 地址} 对象或 [{name, address}] 列表")
+    if len(items) > _MAX_SYMBOLS:
+        raise ValueError(f"外部符号数量超过上限 {_MAX_SYMBOLS}")
+    for name, addr in items:
+        if not isinstance(name, str) or not name:
+            raise ValueError("外部符号名必须为非空字符串")
+        symbols[name] = parse_uint(addr, f"符号 {name!r} 的地址")
+    return audit_id, load_base, members, symbols
+
+
+def run_joint_audit(payload: Any) -> dict[str, Any]:
+    """联合审计纯函数入口，便于测试直接调用。"""
+    audit_id, load_base, members, symbols = _normalize_joint_payload(payload)
+    result = joint_audit(load_base, members, symbols)
+
+    with _store_lock:
+        if not result.ok:
+            record = {
+                "kind": "joint_fail",
+                "audit_id": audit_id,
+                "violation": result.violation.to_dict(),
+            }
+        else:
+            record = {
+                "kind": "joint_pass",
+                "audit_id": audit_id,
+                "conclusion": freeze_joint_conclusion(audit_id, result, symbols),
+                "result": result.to_public_dict(),
+            }
+        _joint_store[audit_id] = record
+    return _public_joint_record(audit_id, record)
+
+
+def _public_joint_record(audit_id: str, record: dict[str, Any]) -> dict[str, Any]:
+    if record["kind"] == "joint_fail":
+        return {"ok": False, "joint": True, "audit_id": audit_id, "violation": record["violation"]}
+    return {
+        "ok": True,
+        "joint": True,
+        "audit_id": audit_id,
+        "conclusion": record["conclusion"],
+        **record["result"],
+    }
+
+
 class AuditHandler(BaseHTTPRequestHandler):
     server_version = "ElfRelocAudit/1.0"
 
@@ -170,6 +288,9 @@ class AuditHandler(BaseHTTPRequestHandler):
                     "records": len(_store),
                     "passed": sum(1 for r in _store.values() if r["kind"] == "pass"),
                     "failed": sum(1 for r in _store.values() if r["kind"] == "fail"),
+                    "joint_records": len(_joint_store),
+                    "joint_passed": sum(1 for r in _joint_store.values() if r["kind"] == "joint_pass"),
+                    "joint_failed": sum(1 for r in _joint_store.values() if r["kind"] == "joint_fail"),
                 }
             self._send_json(HTTPStatus.OK, {"status": "ok", **counts})
             return
@@ -198,13 +319,35 @@ class AuditHandler(BaseHTTPRequestHandler):
                 body = _public_record(audit_id, record)
             self._send_json(HTTPStatus.OK, body)
             return
+        if path.startswith("/api/joint/result/"):
+            audit_id = unquote(path[len("/api/joint/result/") :])
+            if not _AUDIT_ID_RE.match(audit_id):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"ok": False, "error": "bad_audit_id", "audit_id": audit_id,
+                     "message": "审计标识格式非法"},
+                )
+                return
+            with _store_lock:
+                record = _joint_store.get(audit_id)
+                if record is None:
+                    self._send_json(
+                        HTTPStatus.NOT_FOUND,
+                        {"ok": False, "error": "not_found", "audit_id": audit_id, "joint": True,
+                         "message": "该联合审计标识尚无记录"},
+                    )
+                    return
+                body = _public_joint_record(audit_id, record)
+            self._send_json(HTTPStatus.OK, body)
+            return
         self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found", "path": path})
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path
-        if path != "/api/audit":
+        if path not in ("/api/audit", "/api/joint/audit"):
             self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found", "path": path})
             return
+        joint = path == "/api/joint/audit"
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
@@ -227,7 +370,7 @@ class AuditHandler(BaseHTTPRequestHandler):
                                                     "message": f"JSON 解析失败：{exc}"})
             return
         try:
-            record = run_audit(payload)
+            record = run_joint_audit(payload) if joint else run_audit(payload)
         except ValueError as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "bad_request",
                                                     "message": str(exc)})

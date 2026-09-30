@@ -57,16 +57,31 @@
             font-family: var(--mono); font-size: 11.5px; overflow:auto; max-height: 260px; white-space: pre; margin: 8px 0 0; }
   .empty { color: var(--mut); border: 1px dashed var(--line); border-radius: 8px; padding: 30px; text-align: center; }
   .toolbar { display:flex; gap:8px; align-items:center; }
+  .mode-tabs { display:flex; gap:6px; margin-bottom:14px; }
+  .mode-tabs button { flex:1; }
+  .mode-tabs button.active { background: var(--accent); border-color: var(--accent); color:#fff; font-weight:600; }
+  .mem-row { display: grid; grid-template-columns: 120px 1fr auto; gap: 8px; margin-bottom: 6px; align-items:center; }
+  .mem-row input[type=text] { width:100%; }
+  .mem-row input[type=file] { font-size: 11px; color: var(--mut); }
+  .member-card { border:1px solid var(--line); border-radius:8px; padding:10px 12px; margin:8px 0; background:var(--panel2); }
+  .member-card h3 { margin:0 0 6px; font-size:13px; color:#79c0ff; }
+  .src-local { color:#7ee787; } .src-member { color:#79c0ff; } .src-external { color:#d2a8ff; }
 </style>
 </head>
 <body>
 <header>
   <h1>ELF64 重定位载荷审计台</h1>
-  <p>仅接受 ELF64 小端 ET_REL（EM_X86_64）：唯一 <code>.text</code>、指向它的 RELA、R_X86_64_64 / R_X86_64_PC32。失败时定位首个违约项并清除旧成功结论，绝不返回部分补丁。</p>
+  <p>支持单文件审计与 2–8 成员联合审计（ELF64 小端 ET_REL / EM_X86_64：唯一 <code>.text</code>、指向它的 RELA、R_X86_64_64 / R_X86_64_PC32）。联合模式下成员按标识排序、按 <code>.text</code> 对齐连续布局，只允许引用同成员本地定义、唯一其他成员全局定义或明确提供的外部地址。失败时定位首个违约项并清除旧成功结论，整组绝不返回部分补丁。</p>
 </header>
 <main>
   <section class="card">
     <h2>提交审计</h2>
+    <div class="mode-tabs">
+      <button type="button" id="tabSingle" class="active">单文件审计</button>
+      <button type="button" id="tabJoint">多成员联合审计（2–8）</button>
+    </div>
+
+    <div id="singleForm">
     <label for="auditId">稳定审计标识（audit_id）</label>
     <input type="text" id="auditId" placeholder="如 payload-2026-09-29-001" autocomplete="off">
 
@@ -84,6 +99,28 @@
     <div class="row-actions">
       <button type="button" class="primary" id="submitBtn">执行审计</button>
       <button type="button" id="fetchBtn">按标识读取冻结结论</button>
+    </div>
+    </div>
+
+    <div id="jointForm" style="display:none">
+      <label for="jointAuditId">稳定联合审计标识（audit_id）</label>
+      <input type="text" id="jointAuditId" placeholder="如 joint-2026-09-29-001" autocomplete="off">
+
+      <label for="jointLoadBase">同一装载区代码装载基址</label>
+      <input type="text" id="jointLoadBase" placeholder="0x400000">
+
+      <label>供应商拆分交付的成员（2–8 个，具名 Base64 目标文件；按成员标识自动排序布局）</label>
+      <div id="memRows"></div>
+      <button type="button" id="addMem">+ 添加成员</button>
+
+      <label>剩余外部符号地址（不由任何成员提供）</label>
+      <div id="jointSymRows"></div>
+      <button type="button" id="addJointSym">+ 添加外部符号</button>
+
+      <div class="row-actions">
+        <button type="button" class="primary" id="jointSubmitBtn">执行联合审计</button>
+        <button type="button" id="jointFetchBtn">按标识读取联合结论</button>
+      </div>
     </div>
   </section>
 
@@ -215,18 +252,26 @@ function renderPass(r) {
 }
 
 function render(r) {
-  if (r.ok) { $("resultBody").innerHTML = renderPass(r); return; }
-  if (r.violation) { $("resultBody").innerHTML = renderFail(r.violation); return; }
+  if (r.ok) {
+    if (r.joint) { $("resultBody").innerHTML = renderJointPass(r); return; }
+    $("resultBody").innerHTML = renderPass(r); return;
+  }
+  if (r.violation) {
+    if (r.joint) { $("resultBody").innerHTML = renderJointFail(r.violation); return; }
+    $("resultBody").innerHTML = renderFail(r.violation); return;
+  }
   $("resultBody").innerHTML =
     `<div class="banner fail"><div class="verdict">请求失败（${esc(r.error || "error")}）</div>${esc(r.message || JSON.stringify(r))}</div>`;
 }
 
-async function handle(req, opts) {
+async function handle(req, opts, joint = false) {
   let resp, body;
   try { resp = await fetch(req, opts); }
   catch (e) { $("resultBody").innerHTML = `<div class="banner fail"><div class="verdict">网络错误</div>${esc(e.message)}</div>`; return; }
   try { body = await resp.json(); }
-  catch { body = { ok: false, violation: { stage: "http", code: "bad_response", message: `HTTP ${resp.status}：响应不是 JSON` } }; }
+  catch {
+    body = { ok: false, joint, violation: { stage: "http", code: "bad_response", message: `HTTP ${resp.status}：响应不是 JSON` } };
+  }
   render(body);
 }
 
@@ -244,6 +289,163 @@ $("fetchBtn").onclick = () => {
   if (!id) { $("resultBody").innerHTML = `<div class="banner fail"><div class="verdict">输入有误</div>请填写稳定审计标识</div>`; return; }
   $("resultBody").innerHTML = '<div class="empty">读取中……</div>';
   handle(`/api/result/${encodeURIComponent(id)}`);
+};
+
+// ---------------------------------------------------------------------------
+// 多成员联合审计
+// ---------------------------------------------------------------------------
+const memberFiles = new Map(); // 行元素 -> base64
+
+function addMemRow(id = "") {
+  const row = document.createElement("div");
+  row.className = "mem-row";
+  row.innerHTML =
+    `<input type="text" class="mem-id" placeholder="成员标识（如 alpha）" autocomplete="off">` +
+    `<input type="file" class="mem-file" accept=".o,application/octet-stream">` +
+    `<button type="button" class="icon-btn" title="删除">✕</button>`;
+  row.querySelector(".mem-id").value = id;
+  row.querySelector("button").onclick = () => { memberFiles.delete(row); row.remove(); };
+  row.querySelector(".mem-file").onchange = async () => {
+    const f = row.querySelector(".mem-file").files[0];
+    if (!f) { memberFiles.delete(row); return; }
+    const buf = new Uint8Array(await f.arrayBuffer());
+    let bin = "";
+    for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode(...buf.subarray(i, i + 0x8000));
+    memberFiles.set(row, btoa(bin));
+  };
+  $("memRows").appendChild(row);
+}
+$("addMem").onclick = () => addMemRow();
+addMemRow(); addMemRow();
+
+function addJointSymRow(name = "", addr = "") {
+  const row = document.createElement("div");
+  row.className = "sym-row";
+  row.innerHTML =
+    `<input type="text" class="sym-name" placeholder="外部符号名" autocomplete="off">` +
+    `<input type="text" class="sym-addr" placeholder="地址（如 0x600000）" autocomplete="off">` +
+    `<button type="button" class="icon-btn" title="删除">✕</button>`;
+  row.querySelector("button").onclick = () => row.remove();
+  row.querySelector(".sym-name").value = name;
+  row.querySelector(".sym-addr").value = addr;
+  $("jointSymRows").appendChild(row);
+}
+$("addJointSym").onclick = () => addJointSymRow();
+
+function collectSyms(container) {
+  const out = {};
+  for (const row of container.children) {
+    const name = row.querySelector(".sym-name").value.trim();
+    const addr = row.querySelector(".sym-addr").value.trim();
+    if (!name && !addr) continue;
+    if (!name || !addr) throw new Error("存在未填完整的符号行（名称与地址均必填）");
+    out[name] = addr;
+  }
+  return out;
+}
+
+$("tabSingle").onclick = () => {
+  $("tabSingle").classList.add("active"); $("tabJoint").classList.remove("active");
+  $("singleForm").style.display = ""; $("jointForm").style.display = "none";
+};
+$("tabJoint").onclick = () => {
+  $("tabJoint").classList.add("active"); $("tabSingle").classList.remove("active");
+  $("jointForm").style.display = ""; $("singleForm").style.display = "none";
+};
+
+function renderJointFail(v) {
+  const rows = [];
+  const push = (k, val) => { if (val !== undefined && val !== null) rows.push(`<tr><td>${esc(k)}</td><td>${esc(val)}</td></tr>`); };
+  push("违约阶段 stage", v.stage);
+  push("违约代码 code", v.code);
+  push("说明 message", v.message);
+  push("成员 member", v.member);
+  push("联合全局项序号 entry_index", v.entry_index);
+  push("所在 RELA 节", v.rela_section);
+  push("节内 RELA 下标 rela_index", v.rela_index);
+  push(".text 写入偏移", v.offset);
+  push("重定位类型", v.type_name);
+  push("符号", v.symbol);
+  if (v.detail) push("明细 detail", JSON.stringify(v.detail));
+  return `<div class="banner fail"><div class="verdict">✕ 联合审计拒绝（FAIL）</div>
+    <div>整组拒绝，首个违约位置已定位如下；该标识下旧的联合成功结论已被清除，不会为任何成员生成部分补丁。</div></div>
+    <table class="viol-table">${rows.join("")}</table>`;
+}
+
+function renderJointPass(r) {
+  const items = r.items.map((it) => `
+    <tr>
+      <td>${esc(it.member)}<div class="muted">#${it.index}</div></td>
+      <td>${esc(it.offset_hex)}</td>
+      <td><span class="tag ${it.type === 1 ? "r1" : "r2"}">${esc(it.type_name)}</span></td>
+      <td><span class="sym">${esc(it.symbol)}</span><div class="muted src-${esc(it.source)}">${esc(it.source)}${it.source_member ? " ← " + esc(it.source_member) : ""}</div></td>
+      <td>${esc(it.S)}</td>
+      <td>${esc(it.A)}<div class="muted">${esc(it.A_hex)}</div></td>
+      <td>${esc(it.P)}</td>
+      <td>${esc(it.value)}</td>
+      <td class="bytes-before">${esc(it.before_hex)}</td>
+      <td class="bytes-after">${esc(it.after_hex)}</td>
+    </tr>`).join("");
+  const members = r.members.map((m) => `
+    <div class="member-card">
+      <h3>成员 ${esc(m.member)} <span class="muted">（布局次序 #${m.order}，对齐 ${m.text_addralign}）</span></h3>
+      <div class="kv">
+        <span class="k">代码基址</span><span>${esc(m.base)}</span>
+        <span class="k">代码范围</span><span>${esc(m.range[0])} – ${esc(m.range[1])}（${m.text_size} 字节）</span>
+        <span class="k">原始文件 SHA-256</span><span>${esc(m.file_sha256)}</span>
+        <span class="k">补丁前 .text SHA-256</span><span>${esc(m.text_sha256_before)}</span>
+        <span class="k">补丁后 .text SHA-256</span><span>${esc(m.patched_sha256)}</span>
+        <span class="k">重定位项数</span><span>${m.item_count}</span>
+      </div>
+      <details><summary>补丁后 .text 十六进制转储</summary><pre class="hex">${esc(hexDump(m.patched_text_hex))}</pre></details>
+    </div>`).join("");
+  return `<div class="banner pass"><div class="verdict">✓ 联合审计通过（PASS）— 结论已冻结</div></div>
+  <div class="kv">
+    <span class="k">联合审计标识</span><span>${esc(r.audit_id)}</span>
+    <span class="k">冻结结论 SHA-256</span><span>${esc(r.conclusion)}</span>
+    <span class="k">装载区基址</span><span>${esc(r.load_base)}</span>
+    <span class="k">成员数 / 重定位项数</span><span>${r.member_count} / ${r.item_count}</span>
+  </div>
+  ${members}
+  <details open><summary>逐项复算（按成员、节内偏移稳定排序；source：local 同成员本地 / member 其他成员全局 / external 外部地址）</summary>
+    <table>
+      <thead><tr><th>成员</th><th>.text 偏移</th><th>类型</th><th>符号 / 来源</th><th>S</th><th>A</th><th>P</th><th>计算值</th><th>写入前</th><th>写入后</th></tr></thead>
+      <tbody>${items || '<tr><td colspan="10" class="muted">无重定位项</td></tr>'}</tbody>
+    </table>
+  </details>`;
+}
+
+$("jointSubmitBtn").onclick = () => {
+  try {
+    const auditId = $("jointAuditId").value.trim();
+    if (!auditId) throw new Error("请填写稳定联合审计标识");
+    const base = $("jointLoadBase").value.trim();
+    if (!base) throw new Error("请填写代码装载基址");
+    const members = [];
+    const ids = new Set();
+    for (const row of $("memRows").children) {
+      const id = row.querySelector(".mem-id").value.trim();
+      if (!id && !row.querySelector(".mem-file").files.length) continue;
+      if (!id) throw new Error("存在未填成员标识的成员行");
+      if (ids.has(id)) throw new Error(`成员标识重复：${id}`);
+      ids.add(id);
+      if (!memberFiles.has(row)) throw new Error(`成员 ${id} 未选择文件或文件读取失败`);
+      members.push({ member_id: id, file_base64: memberFiles.get(row) });
+    }
+    if (members.length < 2 || members.length > 8) throw new Error("联合审计要求 2–8 个成员");
+    const payload = { audit_id: auditId, load_base: base, symbols: collectSyms($("jointSymRows")), members };
+    $("resultBody").innerHTML = '<div class="empty">联合审计中……</div>';
+    handle("/api/joint/audit", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload) }, true);
+  } catch (e) {
+    $("resultBody").innerHTML = `<div class="banner fail"><div class="verdict">输入有误</div>${esc(e.message)}</div>`;
+  }
+};
+
+$("jointFetchBtn").onclick = () => {
+  const id = $("jointAuditId").value.trim();
+  if (!id) { $("resultBody").innerHTML = `<div class="banner fail"><div class="verdict">输入有误</div>请填写稳定联合审计标识</div>`; return; }
+  $("resultBody").innerHTML = '<div class="empty">读取中……</div>';
+  handle(`/api/joint/result/${encodeURIComponent(id)}`, null, true);
 };
 </script>
 </body>
