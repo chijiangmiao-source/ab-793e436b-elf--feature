@@ -24,16 +24,26 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
-from .elfaudit import AuditResult, AuditViolation, audit, freeze_conclusion
+from .elfaudit import (
+    AuditResult,
+    AuditViolation,
+    audit,
+    audit_group,
+    freeze_conclusion,
+)
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 _AUDIT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _MAX_BODY = 8 * 1024 * 1024
 _MAX_SYMBOLS = 4096
+GROUP_MIN_MEMBERS = 2
+GROUP_MAX_MEMBERS = 8
 
 _store_lock = threading.Lock()
 # audit_id -> {"kind": "pass"/"fail", ...}
 _store: dict[str, dict[str, Any]] = {}
+# 联合审计的独立存储：与单文件结论按不同接口命名空间隔离
+_group_store: dict[str, dict[str, Any]] = {}
 
 
 def parse_uint(value: Any, field_name: str) -> int:
@@ -137,6 +147,96 @@ def _public_record(audit_id: str, record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _normalize_group_payload(
+    payload: Any,
+) -> tuple[str, list[dict[str, Any]], int, dict[str, int]]:
+    if not isinstance(payload, dict):
+        raise ValueError("请求体必须是 JSON 对象")
+
+    audit_id = payload.get("audit_id")
+    if not isinstance(audit_id, str) or not _AUDIT_ID_RE.match(audit_id):
+        raise ValueError("audit_id 必须为 1..128 字符，仅限字母数字及 . _ : -，且以字母数字开头")
+
+    raw_members = payload.get("members")
+    if not isinstance(raw_members, list):
+        raise ValueError("members 必须为 [{member_id, file_base64}, ...] 列表")
+    if not GROUP_MIN_MEMBERS <= len(raw_members) <= GROUP_MAX_MEMBERS:
+        raise ValueError(f"联合审计成员数必须在 {GROUP_MIN_MEMBERS}..{GROUP_MAX_MEMBERS} 之间")
+
+    members: list[dict[str, Any]] = []
+    for i, row in enumerate(raw_members):
+        if not isinstance(row, dict) or "member_id" not in row or "file_base64" not in row:
+            raise ValueError(f"members[{i}] 必须包含 member_id 与 file_base64")
+        mid = row["member_id"]
+        if not isinstance(mid, str) or not _AUDIT_ID_RE.match(mid):
+            raise ValueError(
+                f"members[{i}].member_id 必须为 1..128 字符，仅限字母数字及 . _ : -"
+            )
+        b64 = row["file_base64"]
+        if not isinstance(b64, str) or not b64:
+            raise ValueError(f"members[{i}].file_base64 必须为非空 Base64 字符串")
+        try:
+            file_bytes = base64.b64decode(b64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError(f"members[{i}] Base64 解码失败：{exc}") from exc
+        if not file_bytes:
+            raise ValueError(f"members[{i}] 解码后的文件为空")
+        members.append({"member_id": mid, "data": file_bytes})
+
+    if "load_base" not in payload:
+        raise ValueError("缺少 load_base（代码装载基址）")
+    load_base = parse_uint(payload["load_base"], "load_base")
+
+    raw_symbols = payload.get("symbols", {})
+    symbols: dict[str, int] = {}
+    if isinstance(raw_symbols, dict):
+        items: list[tuple[Any, Any]] = list(raw_symbols.items())
+    elif isinstance(raw_symbols, list):
+        items = []
+        for row in raw_symbols:
+            if not isinstance(row, dict) or "name" not in row or "address" not in row:
+                raise ValueError("symbols 列表每项必须包含 name 与 address")
+            items.append((row["name"], row["address"]))
+    else:
+        raise ValueError("symbols 必须为 {名称: 地址} 对象或 [{name, address}] 列表")
+    if len(items) > _MAX_SYMBOLS:
+        raise ValueError(f"外部符号数量超过上限 {_MAX_SYMBOLS}")
+    for name, addr in items:
+        if not isinstance(name, str) or not name:
+            raise ValueError("外部符号名必须为非空字符串")
+        symbols[name] = parse_uint(addr, f"符号 {name!r} 的地址")
+    return audit_id, members, load_base, symbols
+
+
+def run_group_audit(payload: Any) -> dict[str, Any]:
+    """联合审计的纯函数入口，便于测试直接调用。"""
+    audit_id, members, load_base, symbols = _normalize_group_payload(payload)
+    result = audit_group(audit_id, members, load_base, symbols)
+
+    with _store_lock:
+        if not result.ok:
+            # 整组违约：清除该标识下旧的联合成功结论，只保留首个违约定位。
+            record = {
+                "kind": "fail",
+                "audit_id": audit_id,
+                "violation": result.violation.to_dict(),
+            }
+        else:
+            record = {
+                "kind": "pass",
+                "audit_id": audit_id,
+                "result": result.to_public_dict(),
+            }
+        _group_store[audit_id] = record
+    return _public_group_record(audit_id, record)
+
+
+def _public_group_record(audit_id: str, record: dict[str, Any]) -> dict[str, Any]:
+    if record["kind"] == "fail":
+        return {"ok": False, "audit_id": audit_id, "violation": record["violation"]}
+    return record["result"]
+
+
 class AuditHandler(BaseHTTPRequestHandler):
     server_version = "ElfRelocAudit/1.0"
 
@@ -170,6 +270,9 @@ class AuditHandler(BaseHTTPRequestHandler):
                     "records": len(_store),
                     "passed": sum(1 for r in _store.values() if r["kind"] == "pass"),
                     "failed": sum(1 for r in _store.values() if r["kind"] == "fail"),
+                    "group_records": len(_group_store),
+                    "group_passed": sum(1 for r in _group_store.values() if r["kind"] == "pass"),
+                    "group_failed": sum(1 for r in _group_store.values() if r["kind"] == "fail"),
                 }
             self._send_json(HTTPStatus.OK, {"status": "ok", **counts})
             return
@@ -198,11 +301,32 @@ class AuditHandler(BaseHTTPRequestHandler):
                 body = _public_record(audit_id, record)
             self._send_json(HTTPStatus.OK, body)
             return
+        if path.startswith("/api/group/result/"):
+            audit_id = unquote(path[len("/api/group/result/") :])
+            if not _AUDIT_ID_RE.match(audit_id):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"ok": False, "error": "bad_audit_id", "audit_id": audit_id,
+                     "message": "审计标识格式非法"},
+                )
+                return
+            with _store_lock:
+                record = _group_store.get(audit_id)
+                if record is None:
+                    self._send_json(
+                        HTTPStatus.NOT_FOUND,
+                        {"ok": False, "error": "not_found", "audit_id": audit_id,
+                         "message": "该联合审计标识尚无记录"},
+                    )
+                    return
+                body = _public_group_record(audit_id, record)
+            self._send_json(HTTPStatus.OK, body)
+            return
         self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found", "path": path})
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path
-        if path != "/api/audit":
+        if path not in ("/api/audit", "/api/group_audit"):
             self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found", "path": path})
             return
         try:
@@ -227,7 +351,10 @@ class AuditHandler(BaseHTTPRequestHandler):
                                                     "message": f"JSON 解析失败：{exc}"})
             return
         try:
-            record = run_audit(payload)
+            if path == "/api/group_audit":
+                record = run_group_audit(payload)
+            else:
+                record = run_audit(payload)
         except ValueError as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "bad_request",
                                                     "message": str(exc)})

@@ -57,29 +57,59 @@
             font-family: var(--mono); font-size: 11.5px; overflow:auto; max-height: 260px; white-space: pre; margin: 8px 0 0; }
   .empty { color: var(--mut); border: 1px dashed var(--line); border-radius: 8px; padding: 30px; text-align: center; }
   .toolbar { display:flex; gap:8px; align-items:center; }
+  .mode-switch { display: flex; gap: 6px; margin-bottom: 14px; }
+  .mode-switch button { flex: 1; }
+  .mode-switch button.active { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  .member-row { display: grid; grid-template-columns: 130px 1fr auto; gap: 8px; margin-bottom: 8px; align-items: center; }
+  .member-row input[type=text] { width: 100%; }
+  .member-row .mf { font-size: 11px; color: var(--mut); font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .member-head { font-size: 12px; color: var(--mut); margin: 4px 0 6px; display:flex; justify-content:space-between; align-items:center; }
+  .member-block { border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin: 10px 0; background: var(--panel2); }
+  .member-block h3 { margin: 0 0 8px; font-size: 13.5px; color: #79c0ff; }
+  .hidden { display: none; }
 </style>
 </head>
 <body>
 <header>
   <h1>ELF64 重定位载荷审计台</h1>
-  <p>仅接受 ELF64 小端 ET_REL（EM_X86_64）：唯一 <code>.text</code>、指向它的 RELA、R_X86_64_64 / R_X86_64_PC32。失败时定位首个违约项并清除旧成功结论，绝不返回部分补丁。</p>
+  <p>单文件：ELF64 小端 ET_REL（EM_X86_64），唯一 <code>.text</code>、指向它的 RELA、R_X86_64_64 / R_X86_64_PC32。联合审计：2–8 个具名成员按标识排序、按各自 <code>.text</code> 对齐连续布局，跨成员唯一全局解析。失败时定位首个违约项（联合定位到成员与 RELA），绝不返回部分补丁。</p>
 </header>
 <main>
   <section class="card">
     <h2>提交审计</h2>
+    <div class="mode-switch">
+      <button type="button" id="modeSingle" class="active">单文件审计</button>
+      <button type="button" id="modeGroup">联合审计（2–8 个成员）</button>
+    </div>
+
     <label for="auditId">稳定审计标识（audit_id）</label>
     <input type="text" id="auditId" placeholder="如 payload-2026-09-29-001" autocomplete="off">
 
-    <label for="fileInput">供应商交付的可重定位目标文件（.o）</label>
-    <input type="file" id="fileInput">
-    <div class="filemeta" id="fileMeta">未选择文件</div>
+    <div id="singlePanel">
+      <label for="fileInput">供应商交付的可重定位目标文件（.o）</label>
+      <input type="file" id="fileInput">
+      <div class="filemeta" id="fileMeta">未选择文件</div>
 
-    <label for="loadBase">代码装载基址（十进制或 0x 十六进制）</label>
-    <input type="text" id="loadBase" placeholder="0x400000">
+      <label for="loadBase">代码装载基址（十进制或 0x 十六进制）</label>
+      <input type="text" id="loadBase" placeholder="0x400000">
 
-    <label>被引用外部符号地址</label>
-    <div id="symRows"></div>
-    <button type="button" id="addSym">+ 添加符号</button>
+      <label>被引用外部符号地址</label>
+      <div id="symRows"></div>
+      <button type="button" id="addSym">+ 添加符号</button>
+    </div>
+
+    <div id="groupPanel" class="hidden">
+      <div class="member-head"><span>成员（具名 member_id + .o 文件，按标识排序布局）</span></div>
+      <div id="memberRows"></div>
+      <button type="button" id="addMember">+ 添加成员</button>
+
+      <label for="groupLoadBase">代码装载基址（十进制或 0x 十六进制）</label>
+      <input type="text" id="groupLoadBase" placeholder="0x400000">
+
+      <label>剩余外部符号地址（同组未定义引用）</label>
+      <div id="groupSymRows"></div>
+      <button type="button" id="addGroupSym">+ 添加外部符号</button>
+    </div>
 
     <div class="row-actions">
       <button type="button" class="primary" id="submitBtn">执行审计</button>
@@ -113,6 +143,62 @@ function addSymRow(name = "", addr = "") {
 $("addSym").onclick = () => addSymRow();
 addSymRow();
 
+// ---- 联合审计模式 ----
+let groupMode = false;
+let activeView = "single";  // 决定结果渲染与读取接口
+const memberFiles = new Map();  // 行元素 -> {name, base64}
+
+function setMode(group) {
+  groupMode = group;
+  activeView = group ? "group" : "single";
+  $("modeSingle").classList.toggle("active", !group);
+  $("modeGroup").classList.toggle("active", group);
+  $("singlePanel").classList.toggle("hidden", group);
+  $("groupPanel").classList.toggle("hidden", !group);
+}
+$("modeSingle").onclick = () => setMode(false);
+$("modeGroup").onclick = () => setMode(true);
+
+function addMemberRow(mid = "") {
+  const row = document.createElement("div");
+  row.className = "member-row";
+  row.innerHTML =
+    `<input type="text" class="m-id" placeholder="成员标识 member_id" autocomplete="off">` +
+    `<label class="mf"><input type="file" class="m-file"> <span class="m-meta">未选择文件</span></label>` +
+    `<button type="button" class="icon-btn" title="删除">✕</button>`;
+  row.querySelector(".m-id").value = mid;
+  row.querySelector("button").onclick = () => { memberFiles.delete(row); row.remove(); };
+  row.querySelector(".m-file").onchange = async (e) => {
+    const f = e.target.files[0];
+    const meta = row.querySelector(".m-meta");
+    if (!f) { memberFiles.delete(row); meta.textContent = "未选择文件"; return; }
+    const buf = new Uint8Array(await f.arrayBuffer());
+    let bin = "";
+    const CHUNK = 0x8000;
+    for (let i = 0; i < buf.length; i += CHUNK) bin += String.fromCharCode(...buf.subarray(i, i + CHUNK));
+    memberFiles.set(row, { name: f.name, base64: btoa(bin), size: buf.length });
+    meta.textContent = `${f.name} — ${buf.length}B`;
+  };
+  $("memberRows").appendChild(row);
+}
+$("addMember").onclick = () => addMemberRow();
+addMemberRow();
+addMemberRow();
+
+function addGroupSymRow(name = "", addr = "") {
+  const row = document.createElement("div");
+  row.className = "sym-row";
+  row.innerHTML =
+    `<input type="text" class="sym-name" placeholder="外部符号名" autocomplete="off">` +
+    `<input type="text" class="sym-addr" placeholder="地址（如 0x7f1234）" autocomplete="off">` +
+    `<button type="button" class="icon-btn" title="删除">✕</button>`;
+  row.querySelector("button").onclick = () => row.remove();
+  row.querySelector(".sym-name").value = name;
+  row.querySelector(".sym-addr").value = addr;
+  $("groupSymRows").appendChild(row);
+}
+$("addGroupSym").onclick = () => addGroupSymRow();
+
 $("fileInput").onchange = async () => {
   const f = $("fileInput").files[0];
   if (!f) { fileBase64 = ""; $("fileMeta").textContent = "未选择文件"; return; }
@@ -139,10 +225,46 @@ function collectSymbols() {
 function buildPayload() {
   const auditId = $("auditId").value.trim();
   if (!auditId) throw new Error("请填写稳定审计标识");
-  if (!fileBase64) throw new Error("请选择 .o 文件");
   const base = $("loadBase").value.trim();
   if (!base) throw new Error("请填写代码装载基址");
   return { audit_id: auditId, file_base64: fileBase64, load_base: base, symbols: collectSymbols() };
+}
+
+function collectSymRows(containerId) {
+  const out = {};
+  for (const row of $(containerId).children) {
+    const name = row.querySelector(".sym-name").value.trim();
+    const addr = row.querySelector(".sym-addr").value.trim();
+    if (!name && !addr) continue;
+    if (!name || !addr) throw new Error("存在未填完整的符号行（名称与地址均必填）");
+    out[name] = addr;
+  }
+  return out;
+}
+
+function buildGroupPayload() {
+  const auditId = $("auditId").value.trim();
+  if (!auditId) throw new Error("请填写稳定审计标识");
+  const rows = [...$("memberRows").children];
+  if (rows.length < 2 || rows.length > 8) throw new Error("联合审计需要 2–8 个成员");
+  const seen = new Set();
+  const members = rows.map((row, i) => {
+    const mid = row.querySelector(".m-id").value.trim();
+    if (!mid) throw new Error(`第 ${i + 1} 个成员缺少成员标识 member_id`);
+    if (seen.has(mid)) throw new Error(`成员标识重复：${mid}`);
+    seen.add(mid);
+    const mf = memberFiles.get(row);
+    if (!mf) throw new Error(`成员 ${mid} 未选择 .o 文件`);
+    return { member_id: mid, file_base64: mf.base64 };
+  });
+  const base = $("groupLoadBase").value.trim();
+  if (!base) throw new Error("请填写代码装载基址");
+  return {
+    audit_id: auditId,
+    members,
+    load_base: base,
+    symbols: collectSymRows("groupSymRows"),
+  };
 }
 
 function esc(s) { return String(s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
@@ -215,8 +337,88 @@ function renderPass(r) {
 }
 
 function render(r) {
+  if (activeView === "group") { renderGroup(r); return; }
   if (r.ok) { $("resultBody").innerHTML = renderPass(r); return; }
   if (r.violation) { $("resultBody").innerHTML = renderFail(r.violation); return; }
+  $("resultBody").innerHTML =
+    `<div class="banner fail"><div class="verdict">请求失败（${esc(r.error || "error")}）</div>${esc(r.message || JSON.stringify(r))}</div>`;
+}
+
+function itemRows(items) {
+  return items.map((it, n) => `
+    <tr>
+      <td>${n + 1}</td>
+      <td>${esc(it.offset_hex)}</td>
+      <td><span class="tag ${it.type === 1 ? "r1" : "r2"}">${esc(it.type_name)}</span></td>
+      <td><span class="sym">${esc(it.symbol)}</span><div class="muted">sym#${it.symbol_index} @ ${esc(it.rela_section)}[${it.rela_index}]</div></td>
+      <td>${esc(it.S)}</td>
+      <td>${esc(it.A)}<div class="muted">${esc(it.A_hex)}</div></td>
+      <td>${esc(it.P)}</td>
+      <td>${esc(it.value)}</td>
+      <td class="bytes-before">${esc(it.before_hex)}</td>
+      <td class="bytes-after">${esc(it.after_hex)}</td>
+    </tr>`).join("");
+}
+
+function renderGroupFail(v) {
+  const rows = [];
+  const push = (k, val) => { if (val !== undefined && val !== null) rows.push(`<tr><td>${esc(k)}</td><td>${esc(val)}</td></tr>`); };
+  push("违约范围 scope", v.scope);
+  push("违约代码 code", v.code);
+  push("说明 message", v.message);
+  push("成员 member", v.member);
+  push("成员排序序号 member_index", v.member_index);
+  push("所在 RELA 节", v.rela_section);
+  push("节内 RELA 下标 rela_index", v.rela_index);
+  push(".text 写入偏移", v.offset);
+  push("重定位类型", v.type_name);
+  push("符号", v.symbol);
+  if (v.detail) push("明细 detail", JSON.stringify(v.detail));
+  return `<div class="banner fail"><div class="verdict">✕ 联合审计整组拒绝（FAIL）</div>
+    <div>首个违约已定位到具体成员与重定位；该标识下旧的联合成功结论已被清除，不产生任何部分联合结论。</div></div>
+    <table class="viol-table">${rows.join("")}</table>`;
+}
+
+function renderGroupPass(r) {
+  const blocks = r.members.map((m) => {
+    const patches = m.patches.map((p) =>
+      `${p.offset_hex}  +${p.width}  ${p.type_name}  ${p.symbol}  ${p.before_hex} -> ${p.after_hex}`).join("\n");
+    return `<div class="member-block">
+      <h3>成员 ${esc(m.member)} <span class="muted">#${m.member_index}</span></h3>
+      <div class="kv">
+        <span class="k">代码基址 base</span><span>${esc(m.base)}</span>
+        <span class="k">范围 range</span><span>${esc(m.range[0])} – ${esc(m.range[1])}</span>
+        <span class="k">相对装载基址偏移</span><span>${esc(m.base_offset)}</span>
+        <span class="k">.text 大小 / 对齐</span><span>${m.text_size} 字节 / ${m.text_align}</span>
+        <span class="k">原始文件 SHA-256</span><span>${esc(m.file_sha256)}</span>
+        <span class="k">补丁前 .text SHA-256</span><span>${esc(m.text_sha256_before)}</span>
+        <span class="k">补丁后 .text SHA-256</span><span>${esc(m.patched_sha256)}</span>
+        <span class="k">重定位项数</span><span>${m.item_count}</span>
+      </div>
+      <details open><summary>逐项复算（S / A / P / 写入前后字节），按节内偏移排序</summary>
+        <table>
+          <thead><tr><th>#</th><th>.text 偏移</th><th>类型</th><th>符号</th><th>S</th><th>A</th><th>P</th><th>计算值</th><th>写入前</th><th>写入后</th></tr></thead>
+          <tbody>${itemRows(m.items) || '<tr><td colspan="10" class="muted">无重定位项</td></tr>'}</tbody>
+        </table>
+      </details>
+      <details><summary>字节补丁清单</summary><pre class="hex">${esc(patches) || "（无）"}</pre></details>
+      <details><summary>补丁后 .text 十六进制转储</summary><pre class="hex">${esc(hexDump(m.patched_text_hex))}</pre></details>
+    </div>`;
+  }).join("");
+  return `<div class="banner pass"><div class="verdict">✓ 联合审计通过（PASS）— 整组结论已冻结</div></div>
+  <div class="kv">
+    <span class="k">审计标识</span><span>${esc(r.audit_id)}</span>
+    <span class="k">冻结结论 SHA-256</span><span>${esc(r.conclusion)}</span>
+    <span class="k">代码装载基址</span><span>${esc(r.load_base)}</span>
+    <span class="k">整组装载区范围</span><span>${esc(r.region_range[0])} – ${esc(r.region_range[1])}（${r.region_size} 字节）</span>
+    <span class="k">成员数</span><span>${r.member_count}（按成员标识排序）</span>
+  </div>
+  ${blocks}`;
+}
+
+function renderGroup(r) {
+  if (r.ok) { $("resultBody").innerHTML = renderGroupPass(r); return; }
+  if (r.violation) { $("resultBody").innerHTML = renderGroupFail(r.violation); return; }
   $("resultBody").innerHTML =
     `<div class="banner fail"><div class="verdict">请求失败（${esc(r.error || "error")}）</div>${esc(r.message || JSON.stringify(r))}</div>`;
 }
@@ -231,19 +433,24 @@ async function handle(req, opts) {
 }
 
 $("submitBtn").onclick = () => {
-  let payload;
-  try { payload = buildPayload(); }
+  let payload, url;
+  try {
+    if (groupMode) { payload = buildGroupPayload(); url = "/api/group_audit"; }
+    else { payload = buildPayload(); url = "/api/audit"; }
+  }
   catch (e) { $("resultBody").innerHTML = `<div class="banner fail"><div class="verdict">输入有误</div>${esc(e.message)}</div>`; return; }
   // 提交即视为新一轮审计：先清空旧成功结论的展示，最终结论完全以服务端响应为准。
   $("resultBody").innerHTML = '<div class="empty">审计中……</div>';
-  handle("/api/audit", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload) });
+  handle(url, { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload) });
 };
 
 $("fetchBtn").onclick = () => {
   const id = $("auditId").value.trim();
   if (!id) { $("resultBody").innerHTML = `<div class="banner fail"><div class="verdict">输入有误</div>请填写稳定审计标识</div>`; return; }
   $("resultBody").innerHTML = '<div class="empty">读取中……</div>';
-  handle(`/api/result/${encodeURIComponent(id)}`);
+  const path = groupMode ? `/api/group/result/${encodeURIComponent(id)}`
+                        : `/api/result/${encodeURIComponent(id)}`;
+  handle(path);
 };
 </script>
 </body>
